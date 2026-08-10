@@ -2702,9 +2702,15 @@ wizard(){
   echo "    你这台机器的带宽是多少 Mbps？常见 100 / 200 / 300 / 500 / 1000."
   echo
   if [ "$HAVE_IPERF3" = 1 ]; then
-    printf "    %s建议手动输入. %s回车会在执行阶段现场实测一个估值……\n" "$yellow" "$plain"
-    echo "    跳过扫描. 填 0 表示不做整形（端口没有限速器时选这个）."
-    echo "    已经知道限速值？输入 m 跳过拐点扫描直接指定"
+    # 这四行必须一眼看懂各自会不会扫拐点 —— 早先的文案把"跳过扫描"断到了
+    # 回车那一项后面, 而且没有一句话写明"回车 = 自动检测", 结果用户填 0
+    # 以为是自动检测, 实际跳过了整个拐点扫描, 跑完才发现没有测速结果.
+    printf "    %s怎么填              会做什么%s\n" "$yellow" "$plain"
+    echo   "    ────────────────────────────────────────────────────────"
+    echo   "    数字（如 500）      按这个带宽推导缓冲区, 然后实测拐点"
+    echo   "    直接回车            自动实测带宽, 然后实测拐点   ← 不确定就选这个"
+    echo   "    0                   不做整形, 并且【跳过拐点扫描】"
+    echo   "    m                   已知限速值, 直接填, 【跳过拐点扫描】"
   else
     printf "    %s没有 iperf3, 必须手动填一个数字.%s\n" "$yellow" "$plain"
   fi
@@ -2824,8 +2830,8 @@ wizard(){
   fi
   case "$MANUAL_RATE" in
     "")  _conf "整形" "实测拐点后自动决定" ;;
-    off) _conf "整形" "不做整形" ;;
-    *)   _conf "整形" "${MANUAL_RATE} Mbit" ;;
+    off) _conf "整形" "不做整形（不扫拐点）" ;;
+    *)   _conf "整形" "${MANUAL_RATE} Mbit（手动指定, 不扫拐点）" ;;
   esac
   [ "$HAVE_IPERF3" = 1 ] && _conf "对端" "${peer}:${PEER_PORT}"
   _conf "用途" "$([ "$role" = bulk ] && echo '大文件传输 / 备份' || echo '代理 / 加速')"
@@ -2880,7 +2886,10 @@ wizard(){
   printf '\n  %s════ Running ═══════════════════════════════════════════%s\n' "$bold" "$plain"
   preflight_apply        # 确认之前只问不做, 到这里才真的建 swap
 
-  printf '\n  %s[1/5] Base tuning%s\n' "$bold" "$plain"
+  # 总段数: 手动指定限速值/不整形 = 3 段(不扫拐点), 正常流程 = 5 段.
+  # 上游这里无论走哪条路都先打 "[1/5]", 接着却是 "[2/3]", 看着像中间被跳掉了.
+  local NS=5; [ -n "$MANUAL_RATE" ] && NS=3
+  printf '\n  %s[1/%s] Base tuning%s\n' "$bold" "$NS" "$plain"
   if [ "$bw" = auto ]; then
     info "Probing bandwidth (4 streams + pacing, ~15s)..."
     bw=$(probe_bandwidth "$peer" "$(detect_iface)") || die "bandwidth probe failed" 2
