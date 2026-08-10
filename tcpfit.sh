@@ -61,7 +61,9 @@ _c(){ [ -t 1 ] && printf '\033[%sm%s\033[0m' "$1" "$2" || printf '%s' "$2"; }
 info(){ printf '%s %s\n' "$(_c '0;36' '[*]')" "$*"; }
 ok(){   printf '%s %s\n' "$(_c '0;32' '[+]')" "$*"; }
 warn(){ printf '%s %s\n' "$(_c '0;33' '[!]')" "$*" >&2; }
-die(){  printf '%s %s\n' "$(_c '0;31' '[x]')" "$*" >&2; exit "${2:-1}"; }
+# 第二个参数是退出码, 不是消息的一部分 —— 用 $* 会把它一起打出来,
+# 于是 `die "已中止, 未做任何改动" 1` 在屏幕上显示成 "已中止, 未做任何改动 1".
+die(){  printf '%s %s\n' "$(_c '0;31' '[x]')" "$1" >&2; exit "${2:-1}"; }
 
 # 按显示宽度对齐：CJK 占 2 列, printf 的 %-Ns 按字节算会错位.
 # 不能依赖 awk 的多字节支持 —— mawk(Debian 默认) 没有, 会把 3 字节的中文算成 3 个字符.
@@ -154,6 +156,7 @@ PROBE_HIT=""; PROBE_PORT_OK=""
 VS1=""; VR1=""; VS4=""; VR4=""; VDUR=10
 CTRL_PORTS=""
 GUARD_ON=0; GUARD_PID=""; GUARD_IFACE=""; GUARD_MAXMIN=30
+PREFLIGHT_SWAP_GB=""
 FQ_LIMIT=10240; FQ_FLOW=1280
 
 GUARD_BEAT="$STATE_DIR/guard.beat"
@@ -238,7 +241,10 @@ EOF
   disown 2>/dev/null || true
   # 硬兜底: 连看门狗进程都被 OOM 杀了的话, 由 systemd 在最长时限之后收拾
   if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl stop tcpfit-guard.timer >/dev/null 2>&1
+    # 同名单元还在(上一轮残留或 failed)时 systemd-run 会直接失败, 而错误是被吞掉的 ——
+    # 表现就是"硬兜底静默失效". 先清干净再武装.
+    systemctl stop tcpfit-guard.timer tcpfit-guard.service >/dev/null 2>&1
+    systemctl reset-failed tcpfit-guard.service >/dev/null 2>&1
     systemd-run --collect --unit=tcpfit-guard --on-active="$(( maxmin + 5 ))min" \
       /bin/sh -c "[ -f '$GUARD_BEAT' ] && { tc qdisc del dev '$iface' root 2>/dev/null; [ -x '$QDISC_SCRIPT' ] && '$QDISC_SCRIPT' >/dev/null 2>&1; rm -f '$GUARD_BEAT'; }; :" \
       >/dev/null 2>&1 || true
@@ -259,7 +265,8 @@ guard_disarm(){
   [ "$GUARD_ON" = 1 ] || return 0
   GUARD_ON=0; GUARD_PID=""
   rm -f "$GUARD_BEAT" 2>/dev/null           # 看门狗看到文件没了会自行退出
-  systemctl stop tcpfit-guard.timer >/dev/null 2>&1 || true
+  systemctl stop tcpfit-guard.timer tcpfit-guard.service >/dev/null 2>&1 || true
+  systemctl reset-failed tcpfit-guard.service >/dev/null 2>&1 || true
   return 0
 }
 
@@ -850,7 +857,10 @@ take_snapshot(){
     warn "  a) 手工写好出厂值到 $SNAPSHOT（格式见 docs）"
     warn "  b) 先 $(disp) rollback 回到出厂, 再重新 tune"
     warn "  c) 确认无需回滚能力, 则: touch $SNAPSHOT"
-    die "已中止, 未做任何改动" 1
+    # 这里【不能 die】—— harden_swap 也会调它, 而 harden_swap 常常是"调优跑完的
+    # 最后一步". 在这儿 exit 会把前面所有结论一起吞掉, 正是本分支要消灭的那一类.
+    # 由调用方决定是中止整条命令还是只跳过这一步.
+    return 1
   fi
   local iface; iface=$(detect_iface)
   {
@@ -963,7 +973,7 @@ cmd_tune(){
     die "无法确定带宽, 已中止" 1
   fi
 
-  take_snapshot
+  take_snapshot || die "已中止, 未做任何改动"
 
   local bdp buf_max buf_def tcp_mem
   bdp=$(calc_bdp "$bw" "$rtt")
@@ -1161,8 +1171,9 @@ harden_swap(){   # harden_swap <大小>  -> 0 成功 / 1 失败或被拒绝 / 2 
     return 1
   fi
 
-  # 校验全过了再存快照, 打错参数不该留下状态
-  take_snapshot || return 1
+  # 校验全过了再存快照, 打错参数不该留下状态.
+  # 存不下就跳过建 swap（不是退出整个脚本）—— take_snapshot 会自己解释原因.
+  take_snapshot || { warn "跳过 swap: 先按上面的提示处理快照, 再单独跑 $(disp) harden --swap 2G"; return 1; }
 
   info "创建 ${gb}G swap（$SWAPFILE, 文件系统 ${fs}, 可用 ${free} MB）…"
   local created=0 err=""
@@ -1334,7 +1345,7 @@ cmd_shape(){
   [ -n "$rate" ] || die "需要 --rate <Mbit>, 或用 --off 移除整形"
   # 校验必须在 take_snapshot 之前 —— 否则打错一个字就会留下快照和半截 qdisc
   is_posint "$rate" 1 100000 || die "--rate 必须是 1-100000 的整数（Mbit）"
-  take_snapshot
+  take_snapshot || die "已中止, 未做任何改动"
   write_qdisc "$rate" "$iface"
   systemctl restart tcpfit-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$rate"
   # 事后用 tc 核对, 不能只看命令有没有报错
@@ -1601,8 +1612,11 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
 # qdisc 队列、加上调优后放大的 tcp_mem, 足够让内核进入内存压力开始杀进程 ——
 # 被杀的常常就是 sshd（于是"SSH 断了"）或用户的代理进程.
 # 与其跑到一半把机器搞挂, 不如开测之前把这件事摆到台面上.
-sweep_preflight(){   # 返回 1 = 用户选择中止
-  local ram avail
+# defer=1: 只问不做, 答案记在 PREFLIGHT_SWAP_GB 里, 等确认之后由 preflight_apply 执行.
+# 向导必须用 defer —— 否则用户在"开始调优？"那一步选 n 时, swap、fstab、快照
+# 都已经写下去了, 而屏幕上写的是"已取消, 未做任何改动".
+sweep_preflight(){   # sweep_preflight [defer]  返回 1 = 用户选择中止
+  local defer="${1:-0}" ram avail
   ram=$(detect_ram_mb)
   if [ "${ram:-0}" -le 768 ] && ! has_swap; then
     echo
@@ -1611,7 +1625,12 @@ sweep_preflight(){   # 返回 1 = 用户选择中止
     echo "      内存压力就开始杀进程 —— 被杀的往往是 sshd 或你自己的代理."
     echo
     if confirm "  先建一个 2G swap 再开测？（强烈建议）" y; then
-      harden_swap 2 || warn "swap 没建成, 继续测试, 但请盯着内存"
+      if [ "$defer" = 1 ]; then
+        PREFLIGHT_SWAP_GB=2
+        info "  记下了: 确认开始之后先建 2G swap"
+      else
+        harden_swap 2 || warn "swap 没建成, 继续测试, 但请盯着内存"
+      fi
     else
       warn "跳过 swap. 测到一半 SSH 断了 / 进程被杀的话, 多半就是这个原因."
     fi
@@ -1631,6 +1650,13 @@ sweep_preflight(){   # 返回 1 = 用户选择中止
     command -v tmux >/dev/null 2>&1 && \
       echo "      想更稳: 先 tmux new -s tcpfit 再在里面跑, 断线后 tmux attach 接回去."
   fi
+  return 0
+}
+# 把 preflight 记下的动作真正做掉. 只在用户确认之后调用.
+preflight_apply(){
+  [ -n "$PREFLIGHT_SWAP_GB" ] || return 0
+  local g="$PREFLIGHT_SWAP_GB"; PREFLIGHT_SWAP_GB=""
+  harden_swap "$g" || warn "swap 没建成, 继续测试, 但请盯着内存"
   return 0
 }
 
@@ -2115,10 +2141,28 @@ cmd_guard(){
     return 0
   fi
 
+  # 心跳还在跳 = 很可能另一个 tcpfit 正在测速. 这时候把 qdisc 抽走会让那一轮作废.
+  if [ -f "$GUARD_BEAT" ]; then
+    local age; age=$(( $(date +%s) - $(stat -c %Y "$GUARD_BEAT" 2>/dev/null || date +%s) ))
+    if [ "$age" -lt "$GUARD_TTL" ]; then
+      warn "检测到 ${age}s 前还有心跳 —— 可能有另一个 tcpfit 正在测速."
+      warn "现在解除会把它正在用的 qdisc 抽走, 那一轮的结果作废."
+      confirm "  仍然继续？" n || { info "已取消"; return 0; }
+    fi
+  fi
+
   info "清理测试残留…"
   rm -f "$GUARD_BEAT"
-  systemctl stop tcpfit-guard.timer >/dev/null 2>&1 || true
-  pkill -x iperf3 2>/dev/null && info "已收掉残留的 iperf3" || true
+  systemctl stop tcpfit-guard.timer tcpfit-guard.service >/dev/null 2>&1 || true
+  systemctl reset-failed tcpfit-guard.service >/dev/null 2>&1 || true
+  # 只收测速【客户端】. 用户自己常驻的 iperf3 -s 不能动 ——
+  # pkill -x iperf3 分不出客户端和服务端, 会把人家的服务端一起干掉.
+  local p n=0
+  for p in $(pgrep -x iperf3 2>/dev/null); do
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- ' -c ' || continue
+    kill "$p" 2>/dev/null && n=$(( n + 1 ))
+  done
+  [ "$n" -gt 0 ] && info "已收掉 ${n} 个残留的测速客户端（常驻的 iperf3 -s 未动）"
   tc qdisc del dev "$iface" root 2>/dev/null
   if [ -x "$QDISC_SCRIPT" ]; then
     "$QDISC_SCRIPT" >/dev/null 2>&1 && ok "已恢复常驻整形（$(shaper_rate "$iface")）" \
@@ -2200,7 +2244,9 @@ verify_verdict(){
   echo "  验证"
   printf '      %s %s %s %s\n' "$(_pad "" 14)" "$(_rpad "吞吐 Mbps" 12)" "$(_rpad "重传" 9)" "$(_rpad "丢包率" 10)"
   printf '      %s %s %s %s\n' "$(_pad "单流" 14)"     "$(_rpad "${VS1:-测试失败}" 12)" "$(_rpad "${VR1:--}" 9)" "$(_rpad "${lp1:+${lp1}%}" 10)"
-  printf '      %s %s %s %s\n' "$(_pad "${VPAR} 流并发" 14)" "$(_rpad "${VS4:-测试失败}" 12)" "$(_rpad "${VR4:--}" 9)" "$(_rpad "${lp4:+${lp4}%}" 10)"
+  # 单核/小内存机上 VPAR 会被压到 1, 那一行和上面的单流是同一组数, 不必重复打
+  [ "${VPAR:-1}" -gt 1 ] 2>/dev/null && \
+    printf '      %s %s %s %s\n' "$(_pad "${VPAR} 流并发" 14)" "$(_rpad "${VS4:-测试失败}" 12)" "$(_rpad "${VR4:--}" 9)" "$(_rpad "${lp4:+${lp4}%}" 10)"
   echo
   # 吞吐和整形值比, 给结论而不是丢一堆数字
   if [ -n "$VS4" ] && [ -n "$target" ] && [ "$target" -gt 0 ] 2>/dev/null; then
@@ -2787,7 +2833,7 @@ wizard(){
   fi
   # 开测前的机器体检放在这里 —— 确认之后就不该再问任何问题了
   if [ -z "$MANUAL_RATE" ] && [ "$HAVE_IPERF3" = 1 ]; then
-    sweep_preflight || { info "已取消, 未做任何改动"; return 0; }
+    sweep_preflight 1 || { info "已取消, 未做任何改动"; return 0; }
     rule
   fi
   confirm "  开始调优？" y || { info "已取消, 未做任何改动"; return 0; }
@@ -2795,6 +2841,7 @@ wizard(){
   # ══ 执行阶段：全自动, 不再有任何提问 ══════════════════════════════════
   traffic_mark
   printf '\n  %s════ Running ═══════════════════════════════════════════%s\n' "$bold" "$plain"
+  preflight_apply        # 确认之前只问不做, 到这里才真的建 swap
 
   printf '\n  %s[1/5] Base tuning%s\n' "$bold" "$plain"
   if [ "$bw" = auto ]; then
