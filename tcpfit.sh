@@ -533,20 +533,40 @@ disp(){
 # 为什么不能直接复制"正在运行的脚本"：bash <(curl ...) 时 $0 是 /dev/fd/63,
 # 内容已被 bash 读走, 再 cat 只能读到 0 字节；curl | bash 时 $0 = bash, 根本不可读.
 # 实测验证过这两种情况. 所以只能按版本号回拉, 并校验拉到的确实是同一版.
-SELF_URL="https://raw.githubusercontent.com/${REPO_SLUG}/v${VERSION}/tcpfit.sh"
+# 回拉自己的地址. 先试版本 tag(可复现), 再退到 main.
+#
+# 上游只试 tag, 拉不到就【静默跳过安装】—— 于是仓库还没打 tag 的时候, 用户
+# 每次都得敲完整的 curl 一键命令, 而屏幕上没有任何一行说明为什么没装上.
+# 实际踩到了: v0.6.0 的 tag 一时发不出来, 工具就一直装不进 /usr/local/bin.
+#
+# 退到 main 安全吗 —— 安全, 因为把关的从来不是"从哪个 ref 拉", 而是下面那道
+# 校验: 拉回来的必须是 `VERSION="$VERSION"` 的同一版. 版本号对不上就不装.
+# 而用户跑的这一份本来就是从 main 下来的(一键命令就是 main), 所以校验必然一致.
+SELF_URLS="https://raw.githubusercontent.com/${REPO_SLUG}/v${VERSION}/tcpfit.sh
+https://raw.githubusercontent.com/${REPO_SLUG}/main/tcpfit.sh"
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac      # 已经是装好的那份
   command -v curl >/dev/null || return 0
-  curl -fsSL "$SELF_URL" -o "$SELF_PATH".tmp 2>/dev/null || return 0
-  # 校验版本一致. 开发期 main 领先 tag 时这里会失败, 跳过安装也是对的.
-  if [ -s "$SELF_PATH".tmp ] && head -1 "$SELF_PATH".tmp | grep -q '^#!' \
-     && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH".tmp; then
+  local u ok_dl=0
+  for u in $SELF_URLS; do
+    curl -fsSL --max-time 30 "$u" -o "$SELF_PATH".tmp 2>/dev/null || continue
+    # 版本必须和正在跑的这一份一致, 否则宁可不装
+    if [ -s "$SELF_PATH".tmp ] && head -1 "$SELF_PATH".tmp | grep -q '^#!' \
+       && grep -q "^VERSION=\"$VERSION\"" "$SELF_PATH".tmp; then
+      ok_dl=1; break
+    fi
+    rm -f "$SELF_PATH".tmp
+  done
+  if [ "$ok_dl" = 1 ]; then
     mv "$SELF_PATH".tmp "$SELF_PATH"; chmod +x "$SELF_PATH"
     rm -f "$LEGACY_SELF"                      # 清掉旧位置, 免得两份不同版本并存
-    ok "Installed: run 'tcpfit' anytime"
+    ok "已安装到 $SELF_PATH —— 以后直接敲 tcpfit"
   else
     rm -f "$SELF_PATH".tmp
+    # 装不上就明说, 别让用户以为装好了
+    warn "没能把自己装到 $SELF_PATH（拉不到与当前版本一致的副本）."
+    warn "手动装: curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/main/tcpfit.sh -o $SELF_PATH && chmod +x $SELF_PATH"
   fi
 }
 
@@ -2308,13 +2328,21 @@ cmd_update(){
   local from_menu=0
   [ "${1:-}" = "--from-menu" ] && { from_menu=1; shift; }
   info "检查更新…"
-  local latest
-  # 只看 release, 不看 main —— main 可能领先于任何已发布版本
+  local latest src=release
+  # 优先看 release —— 它有 SHA256SUMS 可以校验, 是最可信的来源
   latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
            | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')
-  [ -n "$latest" ] || die "查不到最新版本, 检查网络或稍后再试" 2
+  # 仓库还没发过 release 时, 上游直接 die "查不到最新版本" —— 用户会以为是网络问题,
+  # 实际是这个仓库压根没有 release. 退到读 main 里的 VERSION, 并说清楚来源.
+  if [ -z "$latest" ]; then
+    latest=$(curl -fsSL --max-time 10 "https://raw.githubusercontent.com/${REPO_SLUG}/main/tcpfit.sh" 2>/dev/null \
+             | grep -m1 '^VERSION=' | sed 's/^VERSION="\{0,1\}\([^"]*\)"\{0,1\}.*/\1/')
+    src=main
+    [ -n "$latest" ] || die "查不到最新版本: 既没有 release, 也读不到 main（检查网络）" 2
+    info "该仓库还没有 release, 改按 main 分支的版本号比对"
+  fi
 
-  if [ "$latest" = "$VERSION" ]; then ok "已是最新版本 v$VERSION"; return 0; fi
+  if [ "$latest" = "$VERSION" ]; then ok "已是最新版本 v$VERSION（来源: $src）"; return 0; fi
   # 用 sort -V 比版本号, 字符串比较会把 0.3.10 判成小于 0.3.9
   if [ "$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -1)" = "$VERSION" ]; then
     ok "当前 v$VERSION 比已发布的 v$latest 还新（开发版）"; return 0
@@ -2323,7 +2351,11 @@ cmd_update(){
   echo
   _conf "当前版本" "v$VERSION"
   _conf "最新版本" "v$latest"
-  _conf "更新说明" "https://github.com/${REPO_SLUG}/releases/tag/v$latest"
+  if [ "$src" = release ]; then
+    _conf "更新说明" "https://github.com/${REPO_SLUG}/releases/tag/v$latest"
+  else
+    _conf "来源" "main 分支（该仓库没有 release, 无 SHA256SUMS 可校验）"
+  fi
   echo
   confirm "  现在更新？" y || { info "已取消"; return 0; }
 
@@ -2331,14 +2363,19 @@ cmd_update(){
   # SHA256SUMS 里还有 install.sh, 直接 sha256sum -c 会因为文件不在而失败.
   local dl; dl=$(mktemp -d)
   local base="https://github.com/${REPO_SLUG}/releases/download/v$latest"
-  if ! curl -fsSL --max-time 60 "$base/tcpfit.sh" -o "$dl/tcpfit.sh"; then
+  local srcurl="$base/tcpfit.sh"
+  [ "$src" = main ] && srcurl="https://raw.githubusercontent.com/${REPO_SLUG}/main/tcpfit.sh"
+  if ! curl -fsSL --max-time 60 "$srcurl" -o "$dl/tcpfit.sh"; then
     rm -rf "$dl"; die "下载失败" 2
   fi
-  if command -v sha256sum >/dev/null && curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
+  if [ "$src" = release ] && command -v sha256sum >/dev/null \
+     && curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$dl/SHA256SUMS"; then
     if ! ( cd "$dl" && grep ' tcpfit\.sh$' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
       rm -rf "$dl"; die "SHA256 校验不通过, 未更新" 2
     fi
     info "SHA256 校验通过"
+  elif [ "$src" = main ]; then
+    warn "从 main 更新, 没有 SHA256SUMS 可校验, 只做版本号与脚本头校验"
   else
     warn "取不到 SHA256SUMS 或没有 sha256sum, 退回版本号校验"
   fi
