@@ -239,14 +239,22 @@ EOF
   fi
   GUARD_PID=$!
   disown 2>/dev/null || true
-  # 硬兜底: 连看门狗进程都被 OOM 杀了的话, 由 systemd 在最长时限之后收拾
+  # 硬兜底: 连看门狗进程都被 OOM 杀了的话, 由 systemd 兜一次.
+  #
+  # 它【必须看心跳新不新, 而不是心跳文件在不在】—— 只看存在的话, 一个跑得比
+  # 定时器久的正常扫描会被自己的兜底掐掉 qdisc. --max-minutes 0(不限时) 时
+  # maxmin+5 = 5 分钟, 那就是必现: 扫描刚热身就被自己人捅一刀.
+  # 现在的判据和看门狗进程一致: 心跳停了超过 GUARD_TTL 才算主脚本死了.
   if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     # 同名单元还在(上一轮残留或 failed)时 systemd-run 会直接失败, 而错误是被吞掉的 ——
     # 表现就是"硬兜底静默失效". 先清干净再武装.
     systemctl stop tcpfit-guard.timer tcpfit-guard.service >/dev/null 2>&1
     systemctl reset-failed tcpfit-guard.service >/dev/null 2>&1
-    systemd-run --collect --unit=tcpfit-guard --on-active="$(( maxmin + 5 ))min" \
-      /bin/sh -c "[ -f '$GUARD_BEAT' ] && { tc qdisc del dev '$iface' root 2>/dev/null; [ -x '$QDISC_SCRIPT' ] && '$QDISC_SCRIPT' >/dev/null 2>&1; rm -f '$GUARD_BEAT'; }; :" \
+    # 不限时(0)时给一个宽裕的固定值, 别落到 5 分钟; 有时限就按时限 +5 分钟, 但不低于 30
+    local backstop=$(( maxmin + 5 )); [ "$backstop" -lt 30 ] && backstop=30
+    systemd-run --collect --unit=tcpfit-guard --on-active="${backstop}min" \
+      /bin/sh -c "n=\$(date +%s); t=\$(stat -c %Y '$GUARD_BEAT' 2>/dev/null || echo 0); \
+[ \"\$t\" -gt 0 ] && [ \$(( n - t )) -gt $GUARD_TTL ] && { tc qdisc del dev '$iface' root 2>/dev/null; [ -x '$QDISC_SCRIPT' ] && '$QDISC_SCRIPT' >/dev/null 2>&1; rm -f '$GUARD_BEAT'; }; :" \
       >/dev/null 2>&1 || true
   fi
   GUARD_ON=1
