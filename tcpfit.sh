@@ -23,7 +23,7 @@
 # 上游: github.com/Kylin010/tcpfit (MIT, kylin010). 本分支只做"别把机器跑挂"这件事:
 #   1. SSH 保命    测试期间 SSH/DNS/ICMP 走 HTB 高优先级独立班道, 不跟 iperf3 抢队列
 #   2. 看门狗      改 qdisc 前先武装定时器; 脚本被 kill / SSH 断了也会自动恢复
-#   3. 流量预算    出向字节数硬上限, 超了立刻停扫 —— 不再出现"一次调优跑掉 22 GB"
+#   3. 流量可控    默认不限(准确优先), 但开跑前预估、结束时实报; 需要时可设硬上限
 #   4. 时间预算    墙钟上限, 超了收工
 #   5. 二分找拐点  测量次数从 O(n) 降到 O(log n), 同样精度流量少一个量级
 #   6. 重试收敛    端口轮换 × 重试不再相乘(最多 33 次 → 最多 4 次)
@@ -1721,7 +1721,13 @@ cmd_sweep(){
   # GAP: 档与档之间的静置时间, 让上一条流的状态排空, 避免相邻两档互相干扰
   # prec: 二分停止精度(Mbit). budget/maxmin: 流量与时间硬上限, 0 = 不限.
   local peer="" nominal="" lo="" hi="" dur=8 par=1 margin="" thresh=0.1 GAP=3 cap=2500
-  local prec="" budget="${TCPFIT_BUDGET_GB:-6}" maxmin="${TCPFIT_MAX_MINUTES:-20}"
+  # 默认【不限流量】. 拐点是这个工具的核心结论, 测不准就没有意义 ——
+  # 与其给一个保守的默认值把扫描从中间砍断(实测就发生过: 3 档就收工, 拐点读低),
+  # 不如把额度交给用户显式决定. 开跑前会打印预估流量, 结束时会报实际消耗,
+  # 所以"不限"不等于"不告诉你花了多少".
+  # 时间上限保留但放宽到 60 分钟: 它防的是卡死, 不该在健康的扫描中途生效
+  # (对端不稳时单档最坏 3 端口 × 2 重试 × 33 秒 ≈ 200 秒, 8 档就够顶破 20 分钟).
+  local prec="" budget="${TCPFIT_BUDGET_GB:-0}" maxmin="${TCPFIT_MAX_MINUTES:-60}"
   local budget_explicit=0; [ -n "${TCPFIT_BUDGET_GB:-}" ] && budget_explicit=1
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -2858,8 +2864,8 @@ wizard(){
   # ── 确认 ────────────────────────────────────────────────────────────────
   # 预算: 带宽已知就按带宽估一个, 未知(回车实测)则留给 sweep 在测出带宽后自己定.
   # BUDGET_SET=1 表示用户明确指定过, 那就谁也不许再改.
-  local BUDGET_GB="" MAX_MIN="${TCPFIT_MAX_MINUTES:-20}" BUDGET_SET=0
-  [ "$bw" != auto ] && [ -z "$MANUAL_RATE" ] && BUDGET_GB=$(default_budget_gb "$bw")
+  # 默认不限流量(见 cmd_sweep 里的说明). BUDGET_GB 为空 = 不限.
+  local BUDGET_GB="" MAX_MIN="${TCPFIT_MAX_MINUTES:-60}" BUDGET_SET=0
   echo
   rule
   echo "  确认"
@@ -2890,8 +2896,8 @@ wizard(){
     _conf "预计流量" "约 $(estimate_traffic_gb "$bw") GB（二分定位, 不是逐档扫）"
     _conf ""         "先测一档判断有没有限速器, 没有就到此为止"
   fi
-  [ -z "$MANUAL_RATE" ] && _conf "流量预算" \
-     "$([ -n "$BUDGET_GB" ] && echo "${BUDGET_GB} GB" || echo "按实测带宽自动定") / ${MAX_MIN} 分钟, 用尽即收工"
+  [ -z "$MANUAL_RATE" ] && _conf "流量上限" \
+     "$([ -n "$BUDGET_GB" ] && echo "${BUDGET_GB} GB（用尽即收工）" || echo "不限 —— 跑到测出拐点为止")"
   [ -z "$MANUAL_RATE" ] && _conf "保护" "SSH 独立高优先级班道 + 看门狗自动恢复"
   # 2G 以上扫描代价陡增, 且代理场景的实际流量通常远达不到端口上限.
   # 只提醒, 不阻止 —— 用户可能就是要为大流量场景调.
@@ -2902,18 +2908,16 @@ wizard(){
     echo "      想跳过的话, 重跑时带宽那一问填 0."
   fi
   rule
-  # 流量是真金白银, 给用户一个当场改预算的机会 —— 上游没有任何上限,
-  # 用户是事后看到 "22.80 GB" 才知道自己被跑了多少.
+  # 默认不限. 有流量配额的用户可以在这里给个上限 —— 但要知道代价是
+  # 可能测不到真拐点(用尽时只能取"已测到的最高干净档", 偏低).
   if [ -z "$MANUAL_RATE" ]; then
     local bg
-    bg=$(ask "  流量预算 GB（回车 = ${BUDGET_GB:-自动}, 0 = 不限）" "${BUDGET_GB:-auto}")
-    if [ "$bg" = auto ]; then
-      BUDGET_SET=0
-    elif is_posint "$bg" 0 10000; then
+    bg=$(ask "  流量上限 GB（回车 = 不限, 推荐; 有配额就填个数）" "0")
+    if is_posint "$bg" 0 10000 && [ "$bg" != 0 ]; then
       BUDGET_GB="$bg"; BUDGET_SET=1
-      [ "$BUDGET_GB" = 0 ] && warn "  已关闭流量上限. 拐点扫描会一直跑到出结论为止."
+      warn "  上限 ${bg} GB. 用尽时会取已测到的最高干净档, 可能低于真实拐点."
     else
-      warn "  预算要填 0-10000 的整数, 这次按${BUDGET_GB:+ ${BUDGET_GB} GB}${BUDGET_GB:-自动}处理"
+      BUDGET_GB=""; BUDGET_SET=0
     fi
     echo
   fi
@@ -3183,8 +3187,8 @@ tcpfit v${VERSION} — 单机 TCP 调优（fork of Kylin010/tcpfit v${UPSTREAM_V
   tcpfit update                           检查更新
 
 sweep 的保护性选项:
-  --budget-gb N     出向流量硬上限, 用尽立即收工并给出已有结论（默认按带宽自动估）
-  --max-minutes N   墙钟上限, 默认 20
+  --budget-gb N     出向流量硬上限, 用尽立即收工并给出已有结论（默认 0 = 不限）
+  --max-minutes N   墙钟上限, 默认 60（防卡死用, 正常扫描 3-5 分钟）
   --precision N     二分停止精度(Mbit), 默认按带宽自动取 5-25
   --dur N           每档测多少秒, 默认 8
   --parallel N      并发流数, 会被内存/核数自动压低
