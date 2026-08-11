@@ -1626,6 +1626,23 @@ loss_pct(){   # loss_pct <重传数> <吞吐Mbps> <秒数>
   }'
 }
 
+# 结论是"不需要整形"时, 网卡上却还挂着别轮设的整形 —— 必须点破.
+# 常见于: 这台机器先跑过上游版本, 那份整形挂在同名的 tcpfit-qdisc.service 上,
+# 而且 qdisc_restore 每轮测完还会把它重新装回去, 不说的话用户根本不会发现.
+warn_stale_shaper(){   # warn_stale_shaper <iface>
+  local cur; cur=$(shaper_rate "$1")
+  [ -n "$cur" ] || return 0
+  echo
+  warn "但网卡上仍有一份整形在生效: ${cur}（不是这轮设的）"
+  if tc class show dev "$1" 2>/dev/null | grep -q ' 1:5 '; then
+    warn "它带 SSH 班道, 结构是新的."
+  else
+    warn "它【没有】SSH 班道 —— 出口被打满时 SSH 仍可能卡死."
+  fi
+  echo "      既然没有限速器, 整形只会限制自己. 去掉: $(disp) shape --off"
+  return 0
+}
+
 # 开测之前先看这台机器扛不扛得住.
 #
 # 图一那台是 469 MB 内存 + 无 swap. 这种机器上满速 iperf3 的收发缓冲、
@@ -1892,7 +1909,9 @@ cmd_sweep(){
       echo
       warn "不限速跑 ${ug} Mbps, 丢包 ${ulp}%, 未检测到限速器."
       mkdir -p "$STATE_DIR"; printf 'NO_KNEE=1\nUNSHAPED=%s\n' "$ug" > "$STATE_DIR/sweep.result"
-      sweep_finish; traffic_report
+      sweep_finish
+      warn_stale_shaper "$iface"
+      traffic_report
       return 3
     fi
 
@@ -2959,15 +2978,39 @@ wizard(){
   elif [ -n "$no_knee" ]; then info "no policer detected, shaping intentionally skipped"
   else warn "no knee measured, shaping skipped"; fi
 
+  # 本轮没设整形, 不代表网卡上就没有整形.
+  # 这台机器可能被上游版本(或更早的本工具)装过一份, 它就挂在同名的
+  # tcpfit-qdisc.service 上, 而且 qdisc_restore 每轮测完还会把它重新装回去.
+  # 不点破的话, 结果页写"整形 未设置"而机器实际仍被限速, 两者对不上;
+  # 更麻烦的是老版本装的是单班道结构, SSH 没有保护.
+  local stale_shaper=""
+  if [ -z "$rate" ]; then
+    stale_shaper=$(shaper_rate "$(detect_iface)")
+    if [ -n "$stale_shaper" ]; then
+      echo
+      warn "网卡上仍有一份【本轮之外】的整形在生效: ${stale_shaper}"
+      warn "多半是上游版本或早前的运行留下的（同名 tcpfit-qdisc.service）."
+      if tc class show dev "$(detect_iface)" 2>/dev/null | grep -q ' 1:5 '; then
+        warn "它带 SSH 班道, 结构是新的."
+      else
+        warn "它【没有】SSH 班道 —— 出口被打满时 SSH 仍可能卡死."
+      fi
+      echo "      本轮结论是这台机器不需要整形, 去掉它: $(disp) shape --off"
+    fi
+  fi
+
   printf '\n  %s[5/5] Verify%s\n' "$bold" "$plain"
   command -v iperf3 >/dev/null && verify_measure "$peer" || warn "no iperf3, throughput not verified"
 
-  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$aborted"
+  wizard_result "$bw" "$rate" "$knee" "$margin" "$ram" "$no_knee" "$out_of_range" "$aborted" "$stale_shaper"
 }
 
 # 结果段落. 正常流程和"手动指定整形值"两条路径共用, 避免两份重复的排版代码.
-wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点] [超范围] [提前收工]
-  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}" abt="${8:-}"
+wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内存MB> [无拐点] [超范围] [提前收工] [遗留整形]
+  local bw="${1:-}" rate="${2:-}" knee="${3:-}" margin="${4:-}" ram="${5:-0}" no_knee="${6:-}" oor="${7:-}" abt="${8:-}" stale="${9:-}"
+  # 网卡上还挂着别轮设的整形时, 不能简单写"未设置" —— 那和机器的实际状态是矛盾的
+  local shape_none="未设置"
+  [ -n "$stale" ] && shape_none="本轮未设置 —— 但网卡上仍有旧整形 ${stale} 在生效"
   printf '\n  %s════ 结果 ══════════════════════════════════════════════%s\n' "$bold" "$plain"
   echo
   if [ -n "$knee" ]; then
@@ -2979,20 +3022,20 @@ wizard_result(){   # wizard_result <带宽> <整形值> <拐点> <余量> <内�
     _conf "已应用整形"   "${rate} Mbit"
     echo
   elif [ -n "$abt" ]; then
-    _conf "整形"         "未设置"
+    _conf "整形"         "$shape_none"
     _conf "原因"         "$([ "$abt" = time ] && echo '时间' || echo '流量')预算用尽, 拐点还没定位出来"
     _conf ""             "这不代表没有限速器, 只代表没测完. 加大预算重跑菜单 3 即可"
     echo
   elif [ -n "$oor" ]; then
-    _conf "整形"         "未设置"
+    _conf "整形"         "$shape_none"
     _conf "原因"         "检测到限速迹象, 但未在扫描范围内定位到拐点"
     echo
   elif [ -n "$no_knee" ]; then
-    _conf "整形"         "未设置"
+    _conf "整形"         "$shape_none"
     _conf "原因"         "扫描未发现限速器, 加整形只会限制自己"
     echo
   else
-    _conf "整形"         "未设置"
+    _conf "整形"         "$shape_none"
     echo
   fi
   verify_verdict "$rate"
