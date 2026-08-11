@@ -316,6 +316,15 @@ safe_streams(){   # safe_streams <期望流数>
 budget_start(){   # budget_start <GB, 0=不限> <分钟, 0=不限>
   BUDGET_BYTES=$(awk -v g="${1:-0}" 'BEGIN{printf "%d", g*1073741824}')
   BUDGET_TX0=$(tx_bytes)
+  # 起点读不到(网卡名解析失败、/sys 不可读、容器里没有该计数器)时, tx_bytes 会返回 0.
+  # 拿 0 当起点的话,"已用流量"= 开机以来的累计值, 一台跑了几天的机器立刻就"超预算",
+  # 扫描刚测两三档就被砍断, 而用户看到的只是一句"预算已用尽", 完全无从判断.
+  # 跑起来的机器计数器不可能恰好是 0, 所以这里直接当成"测不了", 关掉流量预算.
+  if [ "${BUDGET_TX0:-0}" -le 0 ] 2>/dev/null && [ "$BUDGET_BYTES" -gt 0 ]; then
+    warn "读不到网卡出向字节计数器, 流量预算无法计量 —— 本次不设流量上限."
+    warn "时间上限仍然有效. 计数器路径可用 TCPFIT_TX_COUNTER 覆盖."
+    BUDGET_BYTES=0
+  fi
   if [ "${2:-0}" -gt 0 ] 2>/dev/null; then DEADLINE_TS=$(( $(date +%s) + $2 * 60 )); else DEADLINE_TS=0; fi
 }
 budget_used_bytes(){ local t; t=$(tx_bytes); local d=$(( t - BUDGET_TX0 )); [ "$d" -lt 0 ] && d=0; echo "$d"; }
@@ -2075,7 +2084,14 @@ cmd_sweep(){
   if [ -n "$SWEEP_ABORT" ]; then
     echo
     case "$SWEEP_ABORT" in
-      budget) warn "流量预算 ${budget} GB 已用尽, 扫描提前收工." ;;
+      budget)
+        warn "流量预算 ${budget} GB 已用尽, 扫描提前收工."
+        # 把账目摊开. 之前只报"已用尽"而不给数字, 用户没法判断是真跑掉了那么多,
+        # 还是计量本身出了问题(实测就遇到过: 总流量才 2.96 GB 却报 10 GB 用尽).
+        printf '      %s\n' "$(awk -v u="$(budget_used_bytes)" -v b="$BUDGET_BYTES" -v t0="$BUDGET_TX0" \
+          'BEGIN{printf "账目: 本轮已用 %.2f GB / 预算 %.2f GB（起点计数 %d）", u/1073741824, b/1073741824, t0}')"
+        echo "      对不上的话说明计量有问题, 用 --budget-gb 0 关掉流量上限重跑."
+        ;;
       time)   warn "时间预算 ${maxmin} 分钟已用尽, 扫描提前收工." ;;
     esac
     if [ -n "$LAST_OK" ]; then
